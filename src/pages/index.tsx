@@ -1,0 +1,499 @@
+import { useEffect, useState } from 'react';
+import Head from 'next/head';
+import { useWallet } from '@aptos-labs/wallet-adapter-react';
+import { GameDashboard } from '../components/GameDashboard';
+import LoadingComponent from '../components/LoadingComponent';
+import PlayerPanel from '../components/PlayerPanel';
+import ChessGamePanel from '../components/ChessGamePanel';
+import EscrowPanel from '../components/EscrowPanel';
+import AIVsPersonMode from '../components/AIVsPersonMode';
+import AIAgentPanel from '../components/AIAgentPanel';
+import TrainingPanel from '../components/TrainingPanel';
+import { transferToEscrow } from '../utils/transactions';
+import { trainingAgentService } from '../agent/TrainingAgentService';
+
+// Import custom hooks
+import { useWalletConnection } from '../hooks/useWalletConnection';
+import { useEscrow } from '../hooks/useEscrow';
+import { useChessGame } from '../hooks/useChessGame';
+import { useBetting } from '../hooks/useBetting';
+
+// Add type declarations for the window.aptos object
+declare global {
+  interface Window {
+    aptos: any;
+  }
+}
+
+export default function Home() {
+  // Use wallet adapter from Aptos
+  const { signAndSubmitTransaction, disconnect, connected, account } = useWallet();
+  
+  // Mode state
+  const [currentMode, setCurrentMode] = useState<'mainMenu' | 'twoPlayer' | 'aiVsPerson'>('mainMenu');
+  
+  // Use our custom hooks for different aspects of the application
+  const walletHook = useWalletConnection();
+  const escrowHook = useEscrow();
+  const gameHook = useChessGame();
+  const bettingHook = useBetting();
+
+  // Add state for AI betting agent and training mode
+  const [aiEnabled, setAiEnabled] = useState(true);
+  const [trainingModeEnabled, setTrainingModeEnabled] = useState(true);
+  const [lastMove, setLastMove] = useState<{ from: string; to: string } | undefined>(undefined);
+  const [suggestedMove, setSuggestedMove] = useState<{ from: string; to: string; promotion?: string } | null>(null);
+  
+  // Initialize escrow when both wallets are connected
+  useEffect(() => {
+    if (currentMode === 'twoPlayer' && walletHook.player1Wallet && walletHook.player2Wallet && !escrowHook.escrowAddress && !walletHook.isLoading) {
+      console.log("Both wallets connected, initializing escrow");
+      
+      // In simulation mode, create a simulated escrow automatically
+      if (escrowHook.useSimulationMode) {
+        escrowHook.createSimulatedEscrow();
+      }
+    }
+  }, [walletHook.player1Wallet, walletHook.player2Wallet, escrowHook.escrowAddress, walletHook.isLoading, escrowHook.useSimulationMode, currentMode]);
+
+  // Check if both players have locked their escrow and start the game if they have
+  useEffect(() => {
+    if (escrowHook.player1EscrowLocked && escrowHook.player2EscrowLocked && gameHook.gameState !== 'playing') {
+      // Calculate final bet amount
+      const minBetAmount = Math.min(bettingHook.player1Bet, bettingHook.player2Bet);
+      bettingHook.setFinalBetAmount(minBetAmount * 2);
+      
+      // Update escrow status
+      escrowHook.setEscrowLocked(true);
+      
+      // Start the game
+      gameHook.setGameState('playing');
+    }
+  }, [escrowHook.player1EscrowLocked, escrowHook.player2EscrowLocked, gameHook.gameState, bettingHook]);
+
+  // Update lastMove when a move is made
+  useEffect(() => {
+    const handleChessMove = (from: string, to: string) => {
+      setLastMove({ from, to });
+    };
+    
+    // Listen for chess moves
+    if (gameHook && gameHook.game) {
+      const originalOnDrop = gameHook.onDrop;
+      
+      gameHook.onDrop = (sourceSquare: string, targetSquare: string) => {
+        const result = originalOnDrop(sourceSquare, targetSquare);
+        if (result) {
+          handleChessMove(sourceSquare, targetSquare);
+        }
+        return result;
+      };
+    }
+  }, [gameHook]);
+
+  // Handle escrow locking from a player
+  const handleLockEscrow = async (playerNumber: 1 | 2) => {
+    // Use the escrow hook to lock the escrow
+    const result = await escrowHook.lockEscrow(
+      playerNumber,
+      walletHook.player1Wallet,
+      walletHook.player2Wallet,
+      bettingHook.player1Bet,
+      bettingHook.player2Bet,
+      walletHook.ensureCorrectWalletConnected,
+      (address: string) =>walletHook.getAccountBalance({ accountAddress: address }),
+      async (playerNumber, amount, targetAddress) => {
+        return transferToEscrow(playerNumber, amount, targetAddress, escrowHook.useSimulationMode);
+      }
+    );
+
+    // If the lock was successful and it was a simulation, update player wallet balances
+    if (result.wasLocked && escrowHook.useSimulationMode) {
+      const minimumBet = Math.min(bettingHook.player1Bet, bettingHook.player2Bet);
+      
+      // Reduce the balance of the player who locked
+      if (playerNumber === 1 && walletHook.player1Wallet) {
+        walletHook.player1Wallet.balance -= minimumBet;
+      } else if (playerNumber === 2 && walletHook.player2Wallet) {
+        walletHook.player2Wallet.balance -= minimumBet;
+      }
+    }
+  };
+
+  // Announce bets
+  const handleAnnounceUnifiedBet = () => {
+    bettingHook.announceUnifiedBet(
+      walletHook.player1Wallet,
+      walletHook.player2Wallet,
+      () => gameHook.setGameState('betting')
+    );
+  };
+
+  // Forfeit the current game
+  const handleForfeit = () => {
+    const currentPlayerNumber = gameHook.currentPlayer === 'white' ? 1 : 2;
+    const winner = gameHook.forfeitGame(currentPlayerNumber);
+    
+    if (winner) {
+      handleGameEnd(winner);
+    }
+  };
+
+  // Handle game end and payments
+  const handleGameEnd = async (winnerParam?: 'player1' | 'player2' | 'draw' | null) => {
+    // Determine the winner
+    const winner = winnerParam || gameHook.handleGameEnd();
+    
+    // Pay the winner if escrow is locked
+    if (escrowHook.escrowLocked) {
+      await escrowHook.payWinner(
+        winner,
+        walletHook.player1Wallet,
+        walletHook.player2Wallet,
+        bettingHook.player1Bet,
+        bettingHook.player2Bet,
+        bettingHook.finalBetAmount,
+         (address: string) =>walletHook.getAccountBalance({ accountAddress: address })
+      );
+      
+      // If we're in simulation mode, update the player balances accordingly
+      if (escrowHook.useSimulationMode) {
+        if (winner === 'draw') {
+          // Return the bets to each player
+          if (walletHook.player1Wallet) {
+            walletHook.player1Wallet.balance += bettingHook.player1Bet;
+          }
+          
+          if (walletHook.player2Wallet) {
+            walletHook.player2Wallet.balance += bettingHook.player2Bet;
+          }
+        } else {
+          // Give the full pot to the winner
+          if (winner === 'player1' && walletHook.player1Wallet) {
+            walletHook.player1Wallet.balance += bettingHook.finalBetAmount;
+          } else if (winner === 'player2' && walletHook.player2Wallet) {
+            walletHook.player2Wallet.balance += bettingHook.finalBetAmount;
+          }
+        }
+      }
+    }
+    
+    // Reset the game state after a delay
+    setTimeout(() => {
+      resetAllState();
+    }, 3000);
+  };
+
+  // Reset all state
+  const resetAllState = () => {
+    gameHook.resetGameState();
+    bettingHook.resetBettingState();
+    escrowHook.resetEscrowState();
+  };
+
+  // Start a new game
+  const handleStartNewGame = () => {
+    gameHook.startNewGame();
+    bettingHook.resetBettingState();
+    escrowHook.resetEscrowState();
+  };
+
+  // Initialize escrow contract
+  const handleInitializeEscrow = () => {
+    escrowHook.initializeEscrow(walletHook.player1Wallet, walletHook.player2Wallet);
+  };
+
+  // Handle suggesting a move from training panel
+  const handleSuggestMove = (move: { from: string; to: string; promotion?: string }) => {
+    console.log(`Suggesting move from ${move.from} to ${move.to}`);
+    setSuggestedMove(move);
+    
+    // Clear the suggestion after 5 seconds
+    setTimeout(() => {
+      setSuggestedMove(null);
+    }, 5000);
+  };
+
+  // Enable/disable the training agent when training mode is toggled
+  useEffect(() => {
+    trainingAgentService.setEnabled(trainingModeEnabled);
+    
+    // When training mode is enabled, make sure game state is updated
+    if (trainingModeEnabled && gameHook.game) {
+      console.log('Initializing training agent with current game state');
+      trainingAgentService.updateGameState(gameHook.game.fen());
+    }
+  }, [trainingModeEnabled, gameHook.game]);
+
+  // Show error panel if there's an error
+  const error = walletHook.error || escrowHook.error || bettingHook.error;
+  if (error) {
+    return (
+      <div className="container mx-auto px-4 py-8">
+        <div className="p-6 bg-red-50 border border-red-200 rounded-lg max-w-lg mx-auto">
+          <h2 className="text-xl font-bold text-red-800 mb-2">Error</h2>
+          <p className="text-red-600 mb-4">{error}</p>
+          <div className="flex gap-3">
+            <button 
+              onClick={() => {
+                walletHook.setError(null);
+                escrowHook.setError(null);
+                bettingHook.setError(null);
+              }}
+              className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700"
+            >
+              Dismiss
+            </button>
+            <button 
+              onClick={walletHook.resetWalletConnections}
+              className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700"
+            >
+              Reset Wallet Connections
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Show loading state
+  const isLoading = walletHook.isLoading || escrowHook.isLoading || bettingHook.isLoading;
+  if (isLoading) {
+    return <LoadingComponent />;
+  }
+
+  // Main menu mode
+  if (currentMode === 'mainMenu') {
+    return (
+      <div className="container mx-auto px-4 py-8">
+        <Head>
+           <title>Move2Checkmate</title>
+          <meta name="description" content="Play chess with Aptos blockchain integration" />
+          <link rel="icon" href="/favicon.ico" />
+        </Head>
+        
+        <div className="flex flex-col items-center justify-center min-h-[80vh]">
+          <h1 className="text-8xl font-bold text-center mb-8 text-gradient">Move2Checkmate</h1>
+              <div className="relative overflow-hidden">
+  {/* subtle background grid */}
+  <div className="pointer-events-none absolute inset-0 [background:radial-gradient(transparent,rgba(0,0,0,.6)),linear-gradient(90deg,transparent 0px,rgba(255,255,255,.04) 1px,transparent 1px),linear-gradient(0deg,transparent 0px,rgba(255,255,255,.04) 1px,transparent 1px)] bg-[length:100%_100%,24px_24px,24px_24px]" />
+
+  <div className="max-w-5xl mx-auto px-6 pt-14 pb-10 text-center relative">
+    
+
+    <p className="mt-4 text-lg sm:text-xl text-muted-foreground leading-relaxed">
+      Challenge players with <span className="font-semibold text-foreground">real stakes</span>.
+      Play on Aptos with <span className="font-semibold text-foreground">AI opponents</span> and transparent escrow.
+    </p>
+
+    
+
+    {/* trust chips */}
+    <div className="mt-6 flex justify-center gap-2 text-xs">
+      <span className="text-2xl px-2 py-1 rounded-full bg-white/5 border border-white/10">Aptos Testnet</span>
+      <span className="text-2xl px-2 py-1 rounded-full bg-white/5 border border-white/10">Move Smart Contracts</span>
+      <span className="text-2xl px-2 py-1 rounded-full bg-white/5 border border-white/10">AI Agents</span>
+      <span className="text-2xl px-2 py-1 rounded-full bg-white/5 border border-white/10">Escrow Wallet</span>
+    </div>
+  </div>
+</div>
+
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-8 max-w-4xl w-full">
+            <div 
+              className="panel bg-gradient-to-br from-dark-900 via-dark-800 to-dark-900 p-8 rounded-lg text-center cursor-pointer hover:shadow-lg transition-all"
+              onClick={() => setCurrentMode('twoPlayer')}
+            >
+              <h2 className="text-2xl font-bold mb-4 text-gradient">Two Player Mode</h2>
+              <p className="text-gray-300 mb-6">Play against a friend with blockchain-based betting</p>
+              <svg className="w-24 h-24 mx-auto text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+              </svg>
+              <button className="mt-6 btn-primary w-full py-3">
+                Play 2 Player Mode
+              </button>
+            </div>
+            
+            <div 
+              className="panel bg-gradient-to-br from-dark-900 via-dark-800 to-dark-900 p-8 rounded-lg text-center cursor-pointer hover:shadow-lg transition-all"
+              onClick={() => setCurrentMode('aiVsPerson')}
+            >
+              <h2 className="text-2xl font-bold mb-4 text-gradient">AI vs Person Mode</h2>
+              <p className="text-gray-300 mb-6">Challenge our medium difficulty AI in a battle of wits</p>
+              <svg className="w-24 h-24 mx-auto text-accent-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+              </svg>
+              <button className="mt-6 btn-accent w-full py-3">
+                Play AI Mode
+              </button>
+            </div>
+            <div 
+              className="panel bg-gradient-to-br from-dark-900 via-dark-800 to-dark-900 p-8 rounded-lg text-center cursor-pointer hover:shadow-lg transition-all"
+              onClick={() => window.location.href = '/coming-soon'}
+            >
+              <h2 className="text-2xl font-bold mb-4 text-gradient">Online Mode</h2>
+              <p className="text-gray-300 mb-6">Play and compete against the best in the world</p>
+              <svg className="w-24 h-24 mx-auto text-secondary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 2l9 7-9 7-9-7 9-7z" />
+              </svg>
+              <button className="mt-6 btn-secondary w-full py-3">
+                Play Challenger Mode
+              </button>
+            </div>
+
+            <div 
+              className="panel bg-gradient-to-br from-dark-900 via-dark-800 to-dark-900 p-8 rounded-lg text-center cursor-pointer hover:shadow-lg transition-all"
+              onClick={() => window.location.href = '/coming-soon'}
+            >
+              <h2 className="text-2xl font-bold mb-4 text-gradient">More Games</h2>
+              <p className="text-gray-300 mb-6">Bored with Chess? More games adding soon !!</p>
+              <svg className="w-24 h-24 mx-auto text-secondary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 2l9 7-9 7-9-7 9-7z" />
+              </svg>
+              <button className="mt-6 btn-secondary w-full py-3">
+                Let's Go !
+              </button>
+            </div>
+            
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // AI vs Person mode
+  if (currentMode === 'aiVsPerson') {
+    return (
+      <div className="container mx-auto px-4 py-8">
+        <Head>
+          <title>AI vs Person - Move2Checkmate</title>
+          <meta name="description" content="Play chess against AI" />
+          <link rel="icon" href="/favicon.ico" />
+        </Head>
+        
+        <AIVsPersonMode onExit={() => setCurrentMode('mainMenu')} />
+      </div>
+    );
+  }
+
+  // Two Player Mode
+  return (
+    <div className="container mx-auto p-4">
+      <Head>
+        <title>Chess GameFi - Two Player Mode</title>
+      </Head>
+
+      <div className="mb-6">
+        <GameDashboard 
+          gameState={gameHook.gameState as any}
+          player1Wallet={walletHook.player1Wallet}
+          player2Wallet={walletHook.player2Wallet}
+          player1Bet={bettingHook.player1Bet}
+          player2Bet={bettingHook.player2Bet}
+          player1EscrowLocked={escrowHook.player1EscrowLocked}
+          player2EscrowLocked={escrowHook.player2EscrowLocked}
+          escrowLocked={escrowHook.escrowLocked}
+          finalBetAmount={bettingHook.finalBetAmount}
+          winner={gameHook.winner as any}
+        />
+      </div>
+
+      <button 
+        className="mb-6 inline-flex items-center px-4 py-2 bg-dark-800 hover:bg-dark-700 rounded-lg transition-colors"
+        onClick={() => setCurrentMode('mainMenu')}
+      >
+        <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+        </svg>
+        Back to Menu
+      </button>
+
+      <div className="p2p-game-layout">
+        {/* Left side - Controls */}
+        <div className="side-container">
+          <div className="players-container">
+            {/* Player 1 */}
+            <PlayerPanel 
+              playerNumber={1}
+              playerWallet={walletHook.player1Wallet}
+              playerBet={bettingHook.player1Bet}
+              playerEscrowLocked={escrowHook.player1EscrowLocked}
+              otherPlayerBet={bettingHook.player2Bet}
+              gameState={gameHook.gameState}
+              useSimulationMode={escrowHook.useSimulationMode}
+              onConnectWallet={walletHook.connectPlayerWallet}
+              onDisconnectWallet={walletHook.disconnectWallet}
+              onSetManualWalletAddress={walletHook.setManualWalletAddress}
+              onLockEscrow={() => handleLockEscrow(1)}
+            />
+            
+            {/* Player 2 */}
+            <PlayerPanel 
+              playerNumber={2}
+              playerWallet={walletHook.player2Wallet}
+              playerBet={bettingHook.player2Bet}
+              playerEscrowLocked={escrowHook.player2EscrowLocked}
+              otherPlayerBet={bettingHook.player1Bet}
+              gameState={gameHook.gameState}
+              useSimulationMode={escrowHook.useSimulationMode}
+              onConnectWallet={walletHook.connectPlayerWallet}
+              onDisconnectWallet={walletHook.disconnectWallet}
+              onSetManualWalletAddress={walletHook.setManualWalletAddress}
+              onLockEscrow={() => handleLockEscrow(2)}
+            />
+          </div>
+          
+          <div className="escrow-container">
+            {/* Escrow Panel */}
+            <EscrowPanel 
+              escrowAddress={escrowHook.escrowAddress}
+              escrowStatus={escrowHook.escrowStatus}
+              escrowBalance={escrowHook.escrowBalance}
+              useSimulationMode={escrowHook.useSimulationMode}
+              setUseSimulationMode={escrowHook.setUseSimulationMode}
+              onConnectEscrowWallet={() => escrowHook.connectEscrowWallet(walletHook.player1Wallet, walletHook.player2Wallet)}
+              onDisconnectEscrow={() => escrowHook.setEscrowAddress(null)}
+              onCreateSimulatedEscrow={escrowHook.createSimulatedEscrow}
+              onInitializeEscrow={handleInitializeEscrow}
+              onResetGame={resetAllState}
+              onResetWallets={walletHook.resetWalletConnections}
+            />
+          </div>
+        </div>
+        
+        {/* Center - Game Board */}
+        <div className="game-board-container">
+          <ChessGamePanel
+            game={gameHook.game}
+            gameState={gameHook.gameState}
+            currentPlayer={gameHook.currentPlayer}
+            winner={gameHook.winner}
+            finalBetAmount={bettingHook.finalBetAmount}
+            player1Wallet={walletHook.player1Wallet}
+            player2Wallet={walletHook.player2Wallet}
+            player1Bet={bettingHook.player1Bet}
+            player2Bet={bettingHook.player2Bet}
+            onDrop={gameHook.onDrop}
+            onAnnounceUnifiedBet={handleAnnounceUnifiedBet}
+            onStartNewGame={handleStartNewGame}
+            onForfeit={handleForfeit}
+            onPlayer1BetChange={bettingHook.setPlayer1Bet}
+            onPlayer2BetChange={bettingHook.setPlayer2Bet}
+            suggestedMove={suggestedMove}
+          />
+        </div>
+        
+        {/* Right side - AI Agent Panel */}
+        <div className="ai-training-container">
+          <AIAgentPanel
+            aiEnabled={aiEnabled}
+            setAiEnabled={setAiEnabled}
+            gameState={gameHook.gameState}
+            useSimulationMode={escrowHook.useSimulationMode}
+            setUseSimulationMode={escrowHook.setUseSimulationMode}
+          />
+        </div>
+      </div>
+    </div>
+  );
+} 
